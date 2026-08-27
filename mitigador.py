@@ -231,38 +231,47 @@ class EvaluadorProcesos:
     def __init__(self):
         self._io_anterior = {}
 
-    def procesos_con_escritura_alta(self):
-        sospechosos = []
+    def todos_ordenados_por_escritura(self):
+        """
+        Devuelve TODOS los procesos candidatos (no protegidos) ordenados por
+        tasa de escritura a disco, de mayor a menor — sin filtrar por umbral.
+        Se usa para poder identificar al responsable aunque su tasa de
+        escritura no alcance UMBRAL_ESCRITURA_BYTES_SEG (por ejemplo, si el
+        ransomware cifra archivos pequeños y nunca sostiene 5 MB/s).
+        """
+        candidatos = []
         for proc in psutil.process_iter(["pid", "name"]):
             try:
                 pid = proc.info["pid"]
                 if pid == PID_PROPIO:
-                    continue  # nunca evaluarse/matarse a sí mismo
-
+                    continue
                 nombre = (proc.info["name"] or "").lower()
                 if nombre in PROCESOS_PROTEGIDOS:
                     continue
 
                 io = proc.io_counters()
                 ahora = time.time()
-
                 anterior = self._io_anterior.get(pid)
                 self._io_anterior[pid] = (io.write_bytes, ahora)
-
                 if anterior is None:
                     continue
 
                 bytes_prev, t_prev = anterior
                 delta_t = max(ahora - t_prev, 0.001)
                 tasa = (io.write_bytes - bytes_prev) / delta_t
-
-                if tasa >= UMBRAL_ESCRITURA_BYTES_SEG:
-                    sospechosos.append((proc, tasa))
+                if tasa > 0:
+                    candidatos.append((proc, tasa))
 
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
 
-        return sorted(sospechosos, key=lambda x: x[1], reverse=True)
+        return sorted(candidatos, key=lambda x: x[1], reverse=True)
+
+    def procesos_con_escritura_alta(self):
+        return [
+            (proc, tasa) for proc, tasa in self.todos_ordenados_por_escritura()
+            if tasa >= UMBRAL_ESCRITURA_BYTES_SEG
+        ]
 
 
 evaluador = EvaluadorProcesos()
@@ -388,20 +397,54 @@ def ciclo_analisis():
             continue
 
         # Señal 4: correlación con proceso de escritura alta a disco
+        # (esta lista SOLO alimenta puntaje; ver abajo la identificación
+        # real del responsable, que no depende de este umbral)
         sospechosos = evaluador.procesos_con_escritura_alta()
         if sospechosos:
             puntaje += 2
             proc_top, tasa = sospechosos[0]
             detalles.append(
                 f"proceso '{proc_top.name()}' (PID {proc_top.pid}) "
-                f"escribiendo {tasa/1024/1024:.1f} MB/s"
+                f"escribiendo {tasa/1024/1024:.2f} MB/s"
             )
 
         log.info(f"Puntaje de riesgo actual: {puntaje} | " + "; ".join(detalles))
 
-        if puntaje >= PUNTAJE_ACCION and sospechosos:
+        if puntaje == 0:
+            continue
+
+        if puntaje >= PUNTAJE_ACCION:
+            # Para IDENTIFICAR al responsable ya no exigimos que cruce
+            # UMBRAL_ESCRITURA_BYTES_SEG: si ya hay evidencia suficiente
+            # por entropía + eventos + extensión, basta con tomar el
+            # proceso con MAYOR escritura relativa entre los candidatos,
+            # aunque sea de pocos KB/s (archivos pequeños también cuentan).
+            candidatos = evaluador.todos_ordenados_por_escritura()
+
+            # Log de diagnóstico: útil para calibrar UMBRAL_ESCRITURA_BYTES_SEG
+            if candidatos:
+                top3 = ", ".join(
+                    f"{p.name()}(PID {p.pid}): {t/1024:.1f} KB/s"
+                    for p, t in candidatos[:3]
+                )
+                log.info(f"Candidatos por escritura a disco -> {top3}")
+
+            if not candidatos:
+                log.warning(
+                    "Puntaje suficiente pero no se identificó ningún proceso "
+                    "candidato con actividad de escritura a disco. "
+                    "Verifica que el detector corre con permisos suficientes "
+                    "(ejecútalo como Administrador) para leer io_counters() "
+                    "de otros procesos."
+                )
+                continue
+
             log.warning("PATRÓN DE RANSOMWARE DETECTADO. Iniciando contención autónoma.")
-            proc_objetivo, _ = sospechosos[0]
+            proc_objetivo, tasa_objetivo = candidatos[0]
+            log.info(
+                f"Objetivo seleccionado: {proc_objetivo.name()} "
+                f"(PID {proc_objetivo.pid}), {tasa_objetivo/1024:.1f} KB/s"
+            )
             contener_amenaza(proc_objetivo)
 
             # Limpiar estado tras actuar, para no re-disparar sobre el mismo evento
