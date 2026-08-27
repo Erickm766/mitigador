@@ -328,8 +328,13 @@ class ManejadorArchivos(FileSystemEventHandler):
         # de 5s si UN SOLO archivo ya muestra una señal fuerte e inequívoca.
         # Relevante para tandas de archivos pequeños, donde el volumen de
         # E/S nunca sube lo suficiente para las otras señales.
+        # Nota: se registra en nivel debug (no se muestra en consola por
+        # defecto) para no generar ruido con archivos temporales o de
+        # autoguardado legítimos que puntualmente tengan entropía alta;
+        # solo se eleva a alerta visible si esto realmente termina en una
+        # contención (ver reaccionar_evento_individual).
         if es_evento_fuertemente_sospechoso(ruta):
-            log.warning(f"Señal fuerte inmediata en archivo individual: {ruta}")
+            log.debug(f"Señal fuerte candidata en archivo individual: {ruta}")
             reaccionar_evento_individual(ruta)
 
 
@@ -611,13 +616,13 @@ def reaccionar_evento_individual(ruta: str):
         proc_objetivo = candidatos[0][0] if candidatos else None
 
     if not proc_objetivo:
-        log.warning(
-            "Señal fuerte detectada pero aún no se pudo identificar el "
-            "proceso responsable en este ciclo (probará de nuevo con el "
-            "siguiente evento o por el análisis de ventana)."
+        log.debug(
+            f"Señal fuerte en {ruta} pero no se identificó proceso "
+            f"responsable todavía; se reintentará con el análisis por ventana."
         )
         return
 
+    log.warning(f"Señal fuerte confirmada y proceso identificado -> {ruta}")
     log.warning("PATRÓN DE RANSOMWARE DETECTADO (evento individual). Conteniendo.")
     contener_amenaza(proc_objetivo)
     rastreador.eventos.clear()
@@ -685,7 +690,12 @@ def ciclo_analisis():
                 f"escribiendo {tasa/1024/1024:.2f} MB/s"
             )
 
-        log.info(f"Puntaje de riesgo actual: {puntaje} | " + "; ".join(detalles))
+        # Mensajes de bajo puntaje (actividad de fondo normal) se registran
+        # en debug para no saturar la consola; solo se muestran en pantalla
+        # cuando el riesgo ya es notable (a partir de la mitad del umbral
+        # de acción), que es cuando realmente vale la pena que lo veas.
+        nivel_log = log.info if puntaje >= (PUNTAJE_ACCION // 2) else log.debug
+        nivel_log(f"Puntaje de riesgo actual: {puntaje} | " + "; ".join(detalles))
 
         if puntaje == 0:
             continue
