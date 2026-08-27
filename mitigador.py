@@ -75,8 +75,13 @@ UMBRAL_ENTROPIA = 7.5
 # maliciosas conocidas — se detecta la REPETICIÓN anómala en sí misma).
 UMBRAL_EXTENSIONES_REPETIDAS = 5
 
+# Bytes/seg mínimos para que el RESPALDO por volumen de escritura se
+# considere una señal utilizable (evita "adivinar" con ruido de fondo de
+# apps que escriben pocos KB/s sin relación con el incidente).
+UMBRAL_MINIMO_RESPALDO_BYTES_SEG = 100 * 1024  # 100 KB/s
+
 # Bytes escritos por segundo que se consideran actividad de disco anómala
-# para un proceso de usuario normal.
+# para un proceso de usuario normal (contribuye puntaje por sí solo).
 UMBRAL_ESCRITURA_BYTES_SEG = 5 * 1024 * 1024  # 5 MB/s sostenidos
 
 # Puntaje combinado necesario para disparar la respuesta autónoma.
@@ -107,10 +112,18 @@ PROCESOS_PROTEGIDOS = {
     # a cambios masivos de archivos (no como causa) y por eso pueden dar
     # falsos positivos si solo se mide volumen de escritura a disco.
     "searchindexer.exe", "searchprotocolhost.exe", "searchfilterhost.exe",
-    "msmpeng.exe", "nissrv.exe",  # Windows Defender
+    "searchhost.exe", "startmenuexperiencehost.exe",
+    "msmpeng.exe", "nissrv.exe", "securityhealthservice.exe",  # Defender
     "trustedinstaller.exe", "tiworker.exe",
-    "backgroundtaskhost.exe", "dllhost.exe",
+    "backgroundtaskhost.exe", "dllhost.exe", "runtimebroker.exe",
     "onedrive.exe", "wmiprvse.exe",
+    # Aplicaciones de usuario comunes e instaladas del sistema: nunca deben
+    # terminar siendo el "objetivo" de la contención -- si aparecen como
+    # top de escritura es prácticamente siempre ruido de fondo, no la
+    # causa de la ráfaga de archivos observada.
+    "msedge.exe", "msedgewebview2.exe", "chrome.exe", "firefox.exe",
+    "outlook.exe", "winword.exe", "excel.exe", "powerpnt.exe",
+    "notepad.exe", "code.exe", "steam.exe", "discord.exe",
 }
 
 # Nombres de intérprete que indican que el "proceso" real a aislar no es el
@@ -378,39 +391,86 @@ class EvaluadorProcesos:
 
 evaluador = EvaluadorProcesos()
 
+# ---------------------------------------------------------------------------
+# REGISTRO CONTINUO DE ARCHIVOS ABIERTOS
+# ---------------------------------------------------------------------------
+# proc.open_files() es muy sensible al tiempo: si un proceso abre, escribe
+# y cierra un archivo en milisegundos, un único chequeo puntual llega
+# "tarde" casi siempre. Para resolverlo, un hilo dedicado muestrea con
+# frecuencia (varias veces por segundo) qué procesos tienen abierto qué
+# archivo bajo la ruta vigilada, y mantiene un historial breve. Así, la
+# identificación puede preguntar "¿quién tuvo esto abierto hace un
+# instante?" en vez de solo "¿quién lo tiene abierto ahora mismo?".
+
+TTL_REGISTRO_SEGUNDOS = 5.0
+_registro_lock = threading.Lock()
+_registro_archivos_abiertos = {}  # ruta -> (pid, nombre, timestamp)
+
+
+def hilo_muestreo_archivos_abiertos(intervalo=0.25):
+    while True:
+        time.sleep(intervalo)
+        ahora = time.time()
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pid = proc.info["pid"]
+                if pid == PID_PROPIO:
+                    continue
+                nombre = (proc.info["name"] or "").lower()
+                if nombre in PROCESOS_PROTEGIDOS:
+                    continue
+
+                for archivo in proc.open_files():
+                    ruta = archivo.path
+                    if ruta_excluida(ruta):
+                        continue
+                    with _registro_lock:
+                        _registro_archivos_abiertos[ruta] = (pid, nombre, ahora)
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        # Purga de entradas viejas para no crecer indefinidamente
+        with _registro_lock:
+            vencidas = [
+                r for r, (_, _, ts) in _registro_archivos_abiertos.items()
+                if ahora - ts > TTL_REGISTRO_SEGUNDOS
+            ]
+            for r in vencidas:
+                del _registro_archivos_abiertos[r]
+
 
 def identificar_por_archivos_abiertos(rutas_recientes: set):
     """
-    Identificación PRIMARIA y más precisa del proceso responsable: revisa,
-    entre todos los procesos activos, cuál tiene actualmente abierto (o
-    tuvo abierto) alguno de los archivos que el vigilante de sistema de
-    archivos marcó como parte de la ráfaga sospechosa.
-
-    Esto es más confiable que medir solo "quién escribe más a disco",
-    porque procesos legítimos del sistema (indexador de búsqueda,
-    antivirus, sincronización de nube) también generan picos de E/S como
-    REACCIÓN a los cambios masivos, sin ser la causa de ellos.
+    Identificación PRIMARIA y más precisa del proceso responsable: consulta
+    el registro continuo (ver hilo_muestreo_archivos_abiertos) para saber
+    qué proceso tuvo abierto, en los últimos segundos, alguno de los
+    archivos que el vigilante de sistema de archivos marcó como parte de
+    la ráfaga sospechosa. Mucho más confiable que un chequeo instantáneo,
+    porque no depende de que el handle siga abierto en el momento exacto
+    en que se evalúa.
     """
     if not rutas_recientes:
         return None
 
-    for proc in psutil.process_iter(["pid", "name"]):
-        try:
-            pid = proc.info["pid"]
-            if pid == PID_PROPIO:
-                continue
-            nombre = (proc.info["name"] or "").lower()
-            if nombre in PROCESOS_PROTEGIDOS:
-                continue
+    ahora = time.time()
+    mejor_match = None  # (pid, nombre, timestamp)
 
-            for archivo_abierto in proc.open_files():
-                if archivo_abierto.path in rutas_recientes:
-                    return proc
+    with _registro_lock:
+        for ruta in rutas_recientes:
+            entrada = _registro_archivos_abiertos.get(ruta)
+            if entrada and ahora - entrada[2] <= TTL_REGISTRO_SEGUNDOS:
+                if mejor_match is None or entrada[2] > mejor_match[2]:
+                    mejor_match = entrada
 
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
+    if not mejor_match:
+        return None
 
-    return None
+    pid, _, _ = mejor_match
+    try:
+        return psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -515,8 +575,12 @@ def reaccionar_evento_individual(ruta: str):
     proc_objetivo = identificar_por_archivos_abiertos({ruta})
 
     if not proc_objetivo:
-        # Respaldo: proceso con mayor escritura a disco en este instante
-        candidatos = evaluador.todos_ordenados_por_escritura()
+        # Respaldo: proceso con mayor escritura a disco, con un mínimo de
+        # actividad real exigido (evita adivinar con ruido de fondo).
+        candidatos = [
+            (p, t) for p, t in evaluador.todos_ordenados_por_escritura()
+            if t >= UMBRAL_MINIMO_RESPALDO_BYTES_SEG
+        ]
         proc_objetivo = candidatos[0][0] if candidatos else None
 
     if not proc_objetivo:
@@ -615,8 +679,13 @@ def ciclo_analisis():
                 # 2) Respaldo: si no se logró correlacionar por archivo
                 #    (ej. el proceso ya cerró el handle tras escribir),
                 #    se recurre al proceso con mayor escritura a disco,
-                #    excluyendo siempre los procesos legítimos conocidos.
-                candidatos = evaluador.todos_ordenados_por_escritura()
+                #    excluyendo siempre los procesos legítimos conocidos,
+                #    y exigiendo un mínimo de actividad real para no
+                #    "adivinar" con ruido de fondo (ver caso msedge.exe).
+                candidatos = [
+                    (p, t) for p, t in evaluador.todos_ordenados_por_escritura()
+                    if t >= UMBRAL_MINIMO_RESPALDO_BYTES_SEG
+                ]
                 if candidatos:
                     top3 = ", ".join(
                         f"{p.name()}(PID {p.pid}): {t/1024:.1f} KB/s"
@@ -627,9 +696,10 @@ def ciclo_analisis():
                 else:
                     log.warning(
                         "Puntaje suficiente pero no se identificó ningún "
-                        "proceso responsable (ni por archivo abierto ni por "
-                        "E/S). Verifica que el detector corre como "
-                        "Administrador."
+                        "proceso responsable con confianza suficiente "
+                        "(ni por archivo abierto ni por E/S significativa). "
+                        "No se actúa para evitar un falso positivo; se "
+                        "reintentará en el siguiente ciclo."
                     )
                     continue
 
@@ -660,6 +730,11 @@ def main():
 
     hilo_analisis = threading.Thread(target=ciclo_analisis, daemon=True)
     hilo_analisis.start()
+
+    hilo_muestreo = threading.Thread(
+        target=hilo_muestreo_archivos_abiertos, daemon=True
+    )
+    hilo_muestreo.start()
 
     try:
         while True:
