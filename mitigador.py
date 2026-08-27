@@ -12,11 +12,13 @@ from watchdog.events import FileSystemEventHandler
 # ==========================================
 RUTA_MONITOREO = r"C:\Users"        # Ruta a vigilar
 DIR_CUARENTENA = r"C:\Cuarentena"   # Zona de aislamiento
-UMBRAL_MODIFICACIONES = 5          # Sensibilidad de detección
-VENTANA_TIEMPO = 3                  # Ventana en segundos
+UMBRAL_MODIFICACIONES = 5          # Sensibilidad (5 cambios)
+VENTANA_TIEMPO = 2                  # Intervalo en segundos (2s)
+
+# Lista blanca para evitar falsos positivos de procesos del sistema/sincronización
+LISTA_BLANCA = ["onedrive.exe", "explorer.exe", "svchost.exe", "searchhost.exe"]
 
 def es_administrador():
-    """Verifica si el script se está ejecutando con permisos de Administrador."""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
     except Exception:
@@ -55,27 +57,24 @@ class ContencionRansomware(FileSystemEventHandler):
             self.ejecutar_mitigacion_heuristica()
 
     def ejecutar_mitigacion_heuristica(self):
-        """Filtra procesos del sistema y elimina solo ejecutables de usuario sospechosos."""
         proceso_objetivo = None
 
-        for proc in psutil.process_iter(['pid', 'name', 'exe']):
+        for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
             try:
                 pid = proc.info['pid']
                 nombre = (proc.info['name'] or "").lower()
-                ruta_exe = (proc.info['exe'] or "").lower()
+                cmdline = " ".join(proc.info['cmdline'] or []).lower()
 
-                # FILTRO DE SEGURIDAD: Ignorar PIDs del sistema y procesos protegidos
-                if pid < 1000 or pid == os.getpid():
+                # Ignorar PIDs del sistema y la lista blanca
+                if pid < 1000 or pid == os.getpid() or nombre in LISTA_BLANCA:
                     continue
 
-                # Ignorar procesos legítimos de Windows y del sistema
-                if "windows" in ruta_exe or "system32" in ruta_exe or "registry" in nombre:
-                    continue
-
-                # Si el proceso se está ejecutando desde áreas de usuario (Temp, Desktop, Users, etc.)
-                if ruta_exe and ("users" in ruta_exe or "temp" in ruta_exe or "appdata" in ruta_exe):
-                    proceso_objetivo = proc
-                    break
+                # DETECCIÓN CLAVE: Si el proceso es Python ejecutando el script de cifrado
+                if "python.exe" in nombre or "pythonw.exe" in nombre:
+                    # Verificar que no sea el mismo detector
+                    if "detector_autonomo" not in cmdline:
+                        proceso_objetivo = proc
+                        break
 
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -84,35 +83,38 @@ class ContencionRansomware(FileSystemEventHandler):
             try:
                 pid = proceso_objetivo.info['pid']
                 nombre = proceso_objetivo.info['name']
-                ruta = proceso_objetivo.info['exe']
+                cmd = " ".join(proceso_objetivo.info['cmdline'] or [])
 
-                # 1. Detener proceso
+                # 1. Detener inmediatamente la instancia de Python que ejecuta el ransomware
                 proceso_objetivo.kill()
                 self.proceso_mitigado = True
-                print(f"⚡ [AUTÓNOMO] Proceso malicioso (PID: {pid} - {nombre}) DETENIDO.")
+                print(f"⚡ [AUTÓNOMO] Proceso malicioso detectado y DETENIDO (PID: {pid} - {nombre}).")
+                print(f"📌 Comando neutralizado: {cmd}")
 
-                # 2. Mover ejecutable a cuarentena
-                if ruta and os.path.exists(ruta):
-                    destino = os.path.join(DIR_CUARENTENA, f"{os.path.basename(ruta)}.quarantine")
-                    shutil.move(ruta, destino)
-                    print(f"🔒 [CUARENTENA] Ejecutable aislado exitosamente en: {destino}\n")
+                # 2. Intentar mover el archivo .py detectado a cuarentena
+                for arg in proceso_objetivo.info['cmdline']:
+                    if arg.endswith(".py") and os.path.exists(arg) and "detector" not in arg:
+                        destino = os.path.join(DIR_CUARENTENA, f"{os.path.basename(arg)}.quarantine")
+                        shutil.move(arg, destino)
+                        print(f"🔒 [CUARENTENA] Script Python aislado en: {destino}\n")
+                        break
 
             except Exception as e:
-                print(f"❌ Error al aislar proceso: {e}")
+                print(f"❌ Error al mitigar el proceso: {e}")
         else:
-            print("⚠️ No se pudo determinar un proceso de usuario sospechoso en la ráfaga.")
+            print("⚠️ No se identificó una instancia sospechosa de Python en la ráfaga.")
 
 def iniciar_detector():
     if not es_administrador():
         print("❌ ERROR: Este script requiere Permisos de Administrador.")
-        print("👉 Por favor, abre la consola (CMD/PowerShell) como 'Ejecutar como Administrador'.")
+        print("👉 Ejecuta la consola (CMD) como 'Ejecutar como Administrador'.")
         return
 
     print("=" * 65)
     print(" 🛡️  SISTEMA DE DETECCIÓN Y MITIGACIÓN AUTÓNOMA HEURÍSTICA".center(65))
     print("=" * 65)
-    print(f" [*] Permisos de Administrador: CONFIRMADOS")
-    print(f" [*] Estado: Vigilando {RUTA_MONITOREO} de forma autónoma...\n")
+    print(f" [*] Estado: Vigilando {RUTA_MONITOREO} de forma autónoma...")
+    print(f" [*] Regla Activa: Intercepción de scripts o procesos en ráfaga\n")
 
     handler = ContencionRansomware()
     observer = Observer()
