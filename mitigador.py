@@ -84,12 +84,27 @@ UMBRAL_ESCRITURA_BYTES_SEG = 5 * 1024 * 1024  # 5 MB/s sostenidos
 # positivos (ej. alguien copiando una carpeta de fotos manualmente).
 PUNTAJE_ACCION = 6
 
-# Procesos propios del sistema que nunca deben evaluarse ni terminarse
+# Procesos propios del sistema que nunca deben evaluarse ni terminarse.
+# IMPORTANTE: NO se excluye "python.exe" por nombre, porque el ransomware
+# probablemente también corre sobre el intérprete de Python y tendría el
+# mismo nombre de proceso que el detector — excluirlo por nombre lo
+# invisibilizaría por completo. En su lugar, el propio detector se protege
+# a sí mismo por PID (ver PID_PROPIO más abajo), no por nombre genérico.
 PROCESOS_PROTEGIDOS = {
     "system", "system idle process", "svchost.exe", "explorer.exe",
-    "wininit.exe", "csrss.exe", "smss.exe", "services.exe",
-    "lsass.exe", "python.exe",  # excluye el propio detector si corre en python.exe
+    "wininit.exe", "csrss.exe", "smss.exe", "services.exe", "lsass.exe",
 }
+
+# Nombres de intérprete que indican que el "proceso" real a aislar no es el
+# .exe en sí, sino el script que recibe como argumento (python archivo.py).
+# Esto permite que la contención funcione igual de bien tanto si el
+# ransomware corre como script interpretado (cualquier nombre de archivo)
+# como si corre ya compilado en un .exe independiente.
+INTERPRETES_SCRIPT = {"python.exe", "pythonw.exe", "py.exe"}
+
+# PID del propio proceso del detector, para excluirse a sí mismo sin
+# depender del nombre del intérprete (python.exe, pythonw.exe, etc.)
+PID_PROPIO = os.getpid()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -220,12 +235,15 @@ class EvaluadorProcesos:
         sospechosos = []
         for proc in psutil.process_iter(["pid", "name"]):
             try:
+                pid = proc.info["pid"]
+                if pid == PID_PROPIO:
+                    continue  # nunca evaluarse/matarse a sí mismo
+
                 nombre = (proc.info["name"] or "").lower()
                 if nombre in PROCESOS_PROTEGIDOS:
                     continue
 
                 io = proc.io_counters()
-                pid = proc.info["pid"]
                 ahora = time.time()
 
                 anterior = self._io_anterior.get(pid)
@@ -254,16 +272,51 @@ evaluador = EvaluadorProcesos()
 # RESPUESTA AUTÓNOMA
 # ---------------------------------------------------------------------------
 
-def contener_amenaza(proc: psutil.Process):
+def resolver_objetivo_real(proc: psutil.Process):
+    """
+    Determina la ruta que realmente debe aislarse.
+
+    Si el proceso es el intérprete de Python (python.exe, pythonw.exe, py.exe),
+    NO se debe aislar el intérprete —eso rompería el sistema y probablemente
+    falle por permisos—. En su lugar, se busca el script que se le pasó como
+    argumento (cualquiera que sea su nombre) y esa es la ruta a aislar.
+
+    Si el proceso ya es un ejecutable independiente (.exe compilado, ej. con
+    PyInstaller), su propia ruta es el objetivo, como antes.
+    """
     try:
+        nombre = proc.name().lower()
         exe_path = proc.exe()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
-        exe_path = None
+        return None, "desconocido"
 
+    if nombre not in INTERPRETES_SCRIPT:
+        return exe_path, "ejecutable"
+
+    # El proceso es el intérprete: buscar el script en los argumentos
+    try:
+        cmdline = proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None, "desconocido"
+
+    for arg in cmdline[1:]:
+        # Cualquier argumento que apunte a un archivo .py existente,
+        # sin importar el nombre que le haya puesto el atacante.
+        if arg.lower().endswith(".py") and os.path.exists(arg):
+            return os.path.abspath(arg), "script"
+
+    # No se encontró un .py explícito (ej. -c "código inline"): no hay
+    # archivo físico que aislar, solo se puede terminar el proceso.
+    return None, "sin_archivo"
+
+
+def contener_amenaza(proc: psutil.Process):
     nombre = proc.name()
     pid = proc.pid
 
-    log.warning(f"CONTENIENDO PROCESO SOSPECHOSO -> {nombre} (PID {pid})")
+    ruta_objetivo, tipo = resolver_objetivo_real(proc)
+
+    log.warning(f"CONTENIENDO PROCESO SOSPECHOSO -> {nombre} (PID {pid}) [{tipo}]")
 
     try:
         proc.terminate()
@@ -276,12 +329,19 @@ def contener_amenaza(proc: psutil.Process):
 
     log.info(f"Proceso {nombre} (PID {pid}) terminado.")
 
-    if exe_path and os.path.exists(exe_path):
+    if tipo == "sin_archivo":
+        log.warning(
+            "No se identificó un archivo .py físico para aislar "
+            "(posible ejecución inline). Se terminó el proceso únicamente."
+        )
+        return
+
+    if ruta_objetivo and os.path.exists(ruta_objetivo):
         try:
             CARPETA_CUARENTENA.mkdir(parents=True, exist_ok=True)
-            destino = CARPETA_CUARENTENA / f"{Path(exe_path).name}.quarantine"
-            shutil.move(exe_path, destino)
-            log.info(f"Ejecutable aislado en cuarentena: {destino}")
+            destino = CARPETA_CUARENTENA / f"{Path(ruta_objetivo).name}.quarantine"
+            shutil.move(ruta_objetivo, destino)
+            log.info(f"Archivo aislado en cuarentena: {destino}")
         except (OSError, PermissionError) as e:
             log.error(f"No se pudo mover a cuarentena: {e}")
 
