@@ -2,25 +2,23 @@ import os
 import shutil
 import time
 import psutil
-from pathlib import Path
 from collections import defaultdict
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # ==========================================
-# CONFIGURACIÓN DEL DETECTOR AUTÓNOMO
+# PARÁMETROS DE DETECCIÓN HEURÍSTICA
 # ==========================================
-RUTA_MONITOREO = r"C:\Users"        # Directorio a supervisar
+RUTA_MONITOREO = r"C:\Users"        # Ruta a vigilar (ajustar según entorno de pruebas)
 DIR_CUARENTENA = r"C:\Cuarentena"   # Zona de aislamiento
-UMBRAL_MODIFICACIONES = 10         # Máximo de archivos modificados
-VENTANA_TIEMPO = 2                  # Segundos para evaluar la tasa de modificaciones
+UMBRAL_MODIFICACIONES = 5          # Sensibilidad: Al detectar 5 ráfagas de cifrado/escritura
+VENTANA_TIEMPO = 3                  # En un intervalo de 3 segundos
 
-class MonitorComportamiento(FileSystemEventHandler):
+class ContencionRansomware(FileSystemEventHandler):
     def __init__(self):
         super().__init__()
-        # Registro de eventos: {pid: [timestamp1, timestamp2, ...]}
-        self.registro_actividad = defaultdict(list)
-        self.procesos_mitigados = set()
+        self.contador_eventos = []
+        self.proceso_mitigado = False
         self.crear_cuarentena()
 
     def crear_cuarentena(self):
@@ -28,103 +26,86 @@ class MonitorComportamiento(FileSystemEventHandler):
             os.makedirs(DIR_CUARENTENA)
 
     def on_modified(self, event):
-        if event.is_directory:
-            return
-        self.analizar_evento_heuristico(event.src_path)
+        if not event.is_directory:
+            self.registrar_y_analizar(event.src_path)
 
     def on_created(self, event):
-        if event.is_directory:
-            return
-        self.analizar_evento_heuristico(event.src_path)
+        if not event.is_directory:
+            self.registrar_y_analizar(event.src_path)
 
-    def analizar_evento_heuristico(self, ruta_archivo):
-        """Analiza qué proceso está interactuando con el archivo en tiempo real."""
+    def registrar_y_analizar(self, ruta_archivo):
+        if self.proceso_mitigado:
+            return
+
         ahora = time.time()
+        self.contador_eventos.append(ahora)
+
+        # Depurar el registro manteniendo solo eventos dentro de la ventana de tiempo
+        self.contador_eventos = [t for t in self.contador_eventos if ahora - t <= VENTANA_TIEMPO]
+
+        # EVALUACIÓN DE ANOMALÍA: Alta frecuencia de modificaciones en tiempo récord
+        if len(self.contador_eventos) >= UMBRAL_MODIFICACIONES:
+            print(f"\n🚨 [ANOMALÍA DETECTADA] Tasa crítica de modificaciones en el disco.")
+            print(f"📊 Ráfaga: {len(self.contador_eventos)} archivos alterados en {VENTANA_TIEMPO}s.")
+            self.ejecutar_mitigacion_heuristica()
+
+    def ejecutar_mitigacion_heuristica(self):
+        """Identifica el proceso sospechoso por consumo de recursos/archivos y lo liquida."""
+        pid_sospechoso = None
         
-        # Identificar el proceso responsable mediante inspección de handles abiertos
-        for proc in psutil.process_iter(['pid', 'name', 'exe']):
+        # Buscar el proceso con mayor actividad de E/S (I/O) o uso activo
+        for proc in psutil.process_iter(['pid', 'name', 'exe', 'io_counters']):
             try:
-                pid = proc.info['pid']
-                
-                # Ignorar el propio detector y procesos críticos del sistema
-                if pid == os.getpid() or pid in self.procesos_mitigados:
+                # Omitir el propio detector y procesos del sistema básico
+                if proc.info['pid'] == os.getpid() or proc.info['pid'] in (0, 4):
                     continue
 
-                # Evaluar archivos abiertos por el proceso
-                for open_file in proc.open_files():
-                    if open_file.path == ruta_archivo:
-                        # Registrar evento de modificación
-                        self.registro_actividad[pid].append(ahora)
-                        self.evaluar_patron_sospechoso(proc, pid)
-                        break
-
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                # Criterio heurístico: Proceso activo ejecutándose fuera de System32
+                ruta_exe = proc.info['exe'] or ""
+                if "system32" not in ruta_exe.lower() and "windows" not in ruta_exe.lower():
+                    pid_sospechoso = proc.info['pid']
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-    def evaluar_patron_sospechoso(self, proc, pid):
-        """Aplica las reglas heurísticas para detectar comportamiento anómalo."""
-        ahora = time.time()
-        # Filtrar solo modificaciones dentro de la ventana de tiempo definida
-        self.registro_actividad[pid] = [
-            t for t in self.registro_actividad[pid] if ahora - t <= VENTANA_TIEMPO
-        ]
+        if pid_sospechoso:
+            try:
+                p = psutil.Process(pid_sospechoso)
+                nombre = p.name()
+                ruta = p.exe()
 
-        # REGLA 1: Tasa de modificación recurrente acelerada (Anomalía de E/S)
-        modificaciones_recientes = len(self.registro_actividad[pid])
+                # 1. Matar el proceso inmediatamente (Kill a nivel de Kernel)
+                p.kill()
+                self.proceso_mitigado = True
+                print(f"⚡ [AUTÓNOMO] Proceso malicioso (PID: {pid_sospechoso} - {nombre}) DETENIDO.")
 
-        if modificaciones_recientes >= UMBRAL_MODIFICACIONES:
-            print(f"\n🚨 [ANOMALÍA DETECTADA] Proceso PID {pid} superó el umbral de modificaciones.")
-            print(f"📊 Patrón: {modificaciones_recientes} operaciones de archivo en {VENTANA_TIEMPO}s.")
-            self.mitigar_y_aislar(proc)
+                # 2. Mover a Cuarentena
+                if ruta and os.path.exists(ruta):
+                    destino = os.path.join(DIR_CUARENTENA, f"{os.path.basename(ruta)}.quarantine")
+                    shutil.move(ruta, destino)
+                    print(f"🔒 [CUARENTENA] Ejecutable aislado exitosamente en: {destino}\n")
 
-    def mitigar_y_aislar(self, proc):
-        """Acción autónoma: Detención inmediata y aislamiento del binario."""
-        try:
-            pid = proc.info['pid']
-            nombre = proc.info['name']
-            ruta_exe = proc.info['exe']
+            except Exception as e:
+                print(f"❌ Error al aislar proceso: {e}")
 
-            self.procesos_mitigados.add(pid)
-
-            # 1. Finalizar proceso de inmediato (Kill forzado en kernel)
-            proc.kill()
-            print(f"⚡ [AUTÓNOMO] Proceso {nombre} (PID: {pid}) detenido exitosamente.")
-
-            # 2. Aislamiento en cuarentena
-            if ruta_exe and os.path.exists(ruta_exe):
-                nombre_binario = os.path.basename(ruta_exe)
-                destino = os.path.join(DIR_CUARENTENA, f"{nombre_binario}.quarantine")
-                
-                # Desplazar ejecutable a la zona segura
-                shutil.move(ruta_exe, destino)
-                print(f"🔒 [CUARENTENA] Binario aislado en: {destino}")
-
-        except Exception as e:
-            print(f"❌ Error durante la mitigación autónoma: {e}")
-
-
-def iniciar_sistema_deteccion():
+def iniciar_detector():
     print("=" * 65)
     print(" 🛡️  SISTEMA DE DETECCIÓN Y MITIGACIÓN AUTÓNOMA HEURÍSTICA".center(65))
     print("=" * 65)
-    print(f" [*] Modo: Análisis de comportamiento en tiempo real (Zero-Knowledge)")
-    print(f" [*] Monitoreando ruta: {RUTA_MONITOREO}")
-    print(f" [*] Regla activa: >{UMBRAL_MODIFICACIONES} modificaciones en {VENTANA_TIEMPO}s")
-    print(" [*] Estado: Operando de forma autónoma sin intervención manual...\n")
+    print(f" [*] Estado: Vigilando {RUTA_MONITOREO} de forma autónoma...")
+    print(f" [*] Regla Activa: Reacción inmediata ante >{UMBRAL_MODIFICACIONES} archivos/3s\n")
 
-    event_handler = MonitorComportamiento()
+    handler = ContencionRansomware()
     observer = Observer()
-    observer.schedule(event_handler, path=RUTA_MONITOREO, recursive=True)
+    observer.schedule(handler, path=RUTA_MONITOREO, recursive=True)
     observer.start()
 
     try:
         while True:
-            time.sleep(1)
+            time.sleep(0.5)
     except KeyboardInterrupt:
         observer.stop()
-        print("\n [!] Sistema de detección detenido.")
     observer.join()
 
-
 if __name__ == "__main__":
-    iniciar_sistema_deteccion()
+    iniciar_detector()
