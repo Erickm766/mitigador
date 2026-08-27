@@ -84,6 +84,16 @@ UMBRAL_ESCRITURA_BYTES_SEG = 5 * 1024 * 1024  # 5 MB/s sostenidos
 # positivos (ej. alguien copiando una carpeta de fotos manualmente).
 PUNTAJE_ACCION = 6
 
+# Formatos cuyo contenido YA es naturalmente de alta entropía (comprimidos,
+# multimedia, etc.). Un archivo de estos tipos con entropía alta es NORMAL,
+# no una señal de cifrado — se excluyen del chequeo rápido por evento
+# individual para no generar falsos positivos.
+EXTENSIONES_ALTA_ENTROPIA_NATURAL = {
+    ".zip", ".rar", ".7z", ".gz", ".tar", ".xz", ".bz2",
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mp3",
+    ".mov", ".avi", ".mkv",
+}
+
 # Procesos propios del sistema que nunca deben evaluarse ni terminarse.
 # IMPORTANTE: NO se excluye "python.exe" por nombre, porque el ransomware
 # probablemente también corre sobre el intérprete de Python y tendría el
@@ -93,6 +103,14 @@ PUNTAJE_ACCION = 6
 PROCESOS_PROTEGIDOS = {
     "system", "system idle process", "svchost.exe", "explorer.exe",
     "wininit.exe", "csrss.exe", "smss.exe", "services.exe", "lsass.exe",
+    # Procesos legítimos de Windows que generan picos de E/S como REACCIÓN
+    # a cambios masivos de archivos (no como causa) y por eso pueden dar
+    # falsos positivos si solo se mide volumen de escritura a disco.
+    "searchindexer.exe", "searchprotocolhost.exe", "searchfilterhost.exe",
+    "msmpeng.exe", "nissrv.exe",  # Windows Defender
+    "trustedinstaller.exe", "tiworker.exe",
+    "backgroundtaskhost.exe", "dllhost.exe",
+    "onedrive.exe", "wmiprvse.exe",
 }
 
 # Nombres de intérprete que indican que el "proceso" real a aislar no es el
@@ -161,20 +179,73 @@ class RastreadorComportamiento:
     """
     Mantiene, por carpeta raíz vigilada, un historial reciente de eventos
     para poder calcular tasas y patrones dentro de una ventana de tiempo.
+
+    También detecta PERIODICIDAD: si las ráfagas de actividad ocurren a
+    intervalos regulares (sin importar cuál sea ese intervalo), es una
+    señal de automatización -- un humano editando archivos lo hace de
+    forma irregular; un bucle programado no.
     """
+
+    # Silencio mínimo (segundos) para considerar que empezó una NUEVA ráfaga
+    SILENCIO_ENTRE_RAFAGAS = 1.5
+    # Cuántos intervalos entre ráfagas se necesitan para evaluar regularidad
+    MIN_INTERVALOS_PARA_EVALUAR = 3
+    # Máxima variación relativa (coeficiente de variación) para considerar
+    # el patrón "sospechosamente regular". Cuanto más bajo, más estricto.
+    UMBRAL_REGULARIDAD = 0.25
+    # Rango de intervalo típico de un ciclo automatizado de cifrado
+    # (evita falsos positivos con procesos de intervalo muy corto tipo
+    # autoguardado, o muy largo tipo tareas programadas de respaldo)
+    INTERVALO_MIN_SEG = 1.0
+    INTERVALO_MAX_SEG = 30.0
 
     def __init__(self):
         self.lock = threading.Lock()
         self.eventos = deque()  # (timestamp, ruta, extension)
         self.extensiones_recientes = defaultdict(int)
+        self._ultimo_evento_ts = 0.0
+        self._inicios_de_rafaga = deque(maxlen=10)
 
     def registrar_evento(self, ruta: str):
         ahora = time.time()
         ext = Path(ruta).suffix.lower()
         with self.lock:
+            # Detectar si este evento arranca una nueva ráfaga (hubo
+            # silencio suficiente antes) para medir periodicidad.
+            if ahora - self._ultimo_evento_ts >= self.SILENCIO_ENTRE_RAFAGAS:
+                self._inicios_de_rafaga.append(ahora)
+            self._ultimo_evento_ts = ahora
+
             self.eventos.append((ahora, ruta, ext))
             self.extensiones_recientes[ext] += 1
             self._purgar(ahora)
+
+    def patron_periodico_detectado(self):
+        """
+        Devuelve (True, intervalo_promedio) si las ráfagas recientes
+        ocurren a intervalos regulares dentro del rango típico de un
+        ciclo automatizado. No asume ningún valor fijo de segundos.
+        """
+        with self.lock:
+            inicios = list(self._inicios_de_rafaga)
+
+        if len(inicios) < self.MIN_INTERVALOS_PARA_EVALUAR + 1:
+            return False, 0.0
+
+        intervalos = [b - a for a, b in zip(inicios, inicios[1:])]
+        intervalos_en_rango = [
+            i for i in intervalos
+            if self.INTERVALO_MIN_SEG <= i <= self.INTERVALO_MAX_SEG
+        ]
+        if len(intervalos_en_rango) < self.MIN_INTERVALOS_PARA_EVALUAR:
+            return False, 0.0
+
+        promedio = sum(intervalos_en_rango) / len(intervalos_en_rango)
+        varianza = sum((i - promedio) ** 2 for i in intervalos_en_rango) / len(intervalos_en_rango)
+        desviacion = math.sqrt(varianza)
+        coef_variacion = desviacion / promedio if promedio > 0 else 999
+
+        return coef_variacion <= self.UMBRAL_REGULARIDAD, promedio
 
     def _purgar(self, ahora: float):
         while self.eventos and ahora - self.eventos[0][0] > VENTANA_SEGUNDOS:
@@ -197,6 +268,28 @@ rastreador = RastreadorComportamiento()
 # MANEJADOR DE EVENTOS DE SISTEMA DE ARCHIVOS
 # ---------------------------------------------------------------------------
 
+def es_evento_fuertemente_sospechoso(ruta: str) -> bool:
+    """
+    Chequeo RÁPIDO por evento individual (no depende de acumular ventana
+    de tiempo, así que funciona igual de bien con archivos pequeños).
+
+    Señal fuerte: un archivo cuya extensión normalmente indicaría contenido
+    de baja/media entropía (texto, documentos, código, etc.) aparece con
+    entropía muy alta — es decir, su contenido ya no se parece en nada a lo
+    que su extensión promete. Eso es exactamente lo que ocurre cuando un
+    archivo original se sobrescribe con su versión cifrada.
+
+    Se excluyen deliberadamente formatos que YA son de alta entropía por
+    naturaleza (zip, jpg, mp4, etc.) para no disparar con actividad normal.
+    """
+    ext = Path(ruta).suffix.lower()
+    if ext in EXTENSIONES_ALTA_ENTROPIA_NATURAL:
+        return False
+    if not os.path.exists(ruta):
+        return False
+    return calcular_entropia(ruta) >= UMBRAL_ENTROPIA
+
+
 class ManejadorArchivos(FileSystemEventHandler):
 
     def on_created(self, event):
@@ -215,7 +308,16 @@ class ManejadorArchivos(FileSystemEventHandler):
         ruta = ruta or event.src_path
         if ruta_excluida(ruta):
             return
+
         rastreador.registrar_evento(ruta)
+
+        # Camino rápido: no esperar a que se acumule puntaje en la ventana
+        # de 5s si UN SOLO archivo ya muestra una señal fuerte e inequívoca.
+        # Relevante para tandas de archivos pequeños, donde el volumen de
+        # E/S nunca sube lo suficiente para las otras señales.
+        if es_evento_fuertemente_sospechoso(ruta):
+            log.warning(f"Señal fuerte inmediata en archivo individual: {ruta}")
+            reaccionar_evento_individual(ruta)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +377,40 @@ class EvaluadorProcesos:
 
 
 evaluador = EvaluadorProcesos()
+
+
+def identificar_por_archivos_abiertos(rutas_recientes: set):
+    """
+    Identificación PRIMARIA y más precisa del proceso responsable: revisa,
+    entre todos los procesos activos, cuál tiene actualmente abierto (o
+    tuvo abierto) alguno de los archivos que el vigilante de sistema de
+    archivos marcó como parte de la ráfaga sospechosa.
+
+    Esto es más confiable que medir solo "quién escribe más a disco",
+    porque procesos legítimos del sistema (indexador de búsqueda,
+    antivirus, sincronización de nube) también generan picos de E/S como
+    REACCIÓN a los cambios masivos, sin ser la causa de ellos.
+    """
+    if not rutas_recientes:
+        return None
+
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            pid = proc.info["pid"]
+            if pid == PID_PROPIO:
+                continue
+            nombre = (proc.info["name"] or "").lower()
+            if nombre in PROCESOS_PROTEGIDOS:
+                continue
+
+            for archivo_abierto in proc.open_files():
+                if archivo_abierto.path in rutas_recientes:
+                    return proc
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +491,48 @@ def contener_amenaza(proc: psutil.Process):
             log.error(f"No se pudo mover a cuarentena: {e}")
 
 
+_ULTIMA_ACCION_INDIVIDUAL = 0.0
+_LOCK_ACCION_INDIVIDUAL = threading.Lock()
+
+def reaccionar_evento_individual(ruta: str):
+    """
+    Respuesta inmediata ante un solo archivo con señal fuerte, sin esperar
+    a que se acumule el puntaje de la ventana de 5s. Pensado para el caso
+    de archivos de prueba pequeños, donde el volumen de E/S nunca sube lo
+    suficiente para disparar la señal de "escritura anómala".
+
+    Incluye un pequeño "debounce": si ya se actuó hace menos de 2 segundos,
+    no se vuelve a intentar de inmediato (evita duplicar acciones mientras
+    el mismo proceso sigue cifrando el siguiente archivo del lote).
+    """
+    global _ULTIMA_ACCION_INDIVIDUAL
+    with _LOCK_ACCION_INDIVIDUAL:
+        ahora = time.time()
+        if ahora - _ULTIMA_ACCION_INDIVIDUAL < 2.0:
+            return
+        _ULTIMA_ACCION_INDIVIDUAL = ahora
+
+    proc_objetivo = identificar_por_archivos_abiertos({ruta})
+
+    if not proc_objetivo:
+        # Respaldo: proceso con mayor escritura a disco en este instante
+        candidatos = evaluador.todos_ordenados_por_escritura()
+        proc_objetivo = candidatos[0][0] if candidatos else None
+
+    if not proc_objetivo:
+        log.warning(
+            "Señal fuerte detectada pero aún no se pudo identificar el "
+            "proceso responsable en este ciclo (probará de nuevo con el "
+            "siguiente evento o por el análisis de ventana)."
+        )
+        return
+
+    log.warning("PATRÓN DE RANSOMWARE DETECTADO (evento individual). Conteniendo.")
+    contener_amenaza(proc_objetivo)
+    rastreador.eventos.clear()
+    rastreador.extensiones_recientes.clear()
+
+
 # ---------------------------------------------------------------------------
 # BUCLE PRINCIPAL DE ANÁLISIS (autónomo, continuo)
 # ---------------------------------------------------------------------------
@@ -381,6 +559,14 @@ def ciclo_analisis():
                 puntaje += 2
                 detalles.append(f"extensión '{ext}' repetida {cuenta} veces")
                 break
+
+        # Señal 2b: periodicidad -- ráfagas de actividad a intervalos
+        # regulares, sin importar cuál sea el intervalo exacto (no se
+        # asume ningún valor fijo como "cada 5 segundos").
+        es_periodico, intervalo_prom = rastreador.patron_periodico_detectado()
+        if es_periodico:
+            puntaje += 2
+            detalles.append(f"ráfagas periódicas cada ~{intervalo_prom:.1f}s")
 
         # Señal 3: entropía alta en una muestra de los archivos recién tocados
         if eventos:
@@ -414,37 +600,40 @@ def ciclo_analisis():
             continue
 
         if puntaje >= PUNTAJE_ACCION:
-            # Para IDENTIFICAR al responsable ya no exigimos que cruce
-            # UMBRAL_ESCRITURA_BYTES_SEG: si ya hay evidencia suficiente
-            # por entropía + eventos + extensión, basta con tomar el
-            # proceso con MAYOR escritura relativa entre los candidatos,
-            # aunque sea de pocos KB/s (archivos pequeños también cuentan).
-            candidatos = evaluador.todos_ordenados_por_escritura()
+            # 1) Identificación PRIMARIA: qué proceso tiene abiertos los
+            #    archivos específicos que se marcaron como sospechosos.
+            #    Esto es mucho más preciso que solo medir volumen de E/S.
+            rutas_recientes = {ruta for _, ruta, _ in eventos}
+            proc_objetivo = identificar_por_archivos_abiertos(rutas_recientes)
 
-            # Log de diagnóstico: útil para calibrar UMBRAL_ESCRITURA_BYTES_SEG
-            if candidatos:
-                top3 = ", ".join(
-                    f"{p.name()}(PID {p.pid}): {t/1024:.1f} KB/s"
-                    for p, t in candidatos[:3]
+            if proc_objetivo:
+                log.info(
+                    f"Responsable identificado por archivo abierto: "
+                    f"{proc_objetivo.name()} (PID {proc_objetivo.pid})"
                 )
-                log.info(f"Candidatos por escritura a disco -> {top3}")
-
-            if not candidatos:
-                log.warning(
-                    "Puntaje suficiente pero no se identificó ningún proceso "
-                    "candidato con actividad de escritura a disco. "
-                    "Verifica que el detector corre con permisos suficientes "
-                    "(ejecútalo como Administrador) para leer io_counters() "
-                    "de otros procesos."
-                )
-                continue
+            else:
+                # 2) Respaldo: si no se logró correlacionar por archivo
+                #    (ej. el proceso ya cerró el handle tras escribir),
+                #    se recurre al proceso con mayor escritura a disco,
+                #    excluyendo siempre los procesos legítimos conocidos.
+                candidatos = evaluador.todos_ordenados_por_escritura()
+                if candidatos:
+                    top3 = ", ".join(
+                        f"{p.name()}(PID {p.pid}): {t/1024:.1f} KB/s"
+                        for p, t in candidatos[:3]
+                    )
+                    log.info(f"Sin match por archivo. Candidatos por E/S -> {top3}")
+                    proc_objetivo, _ = candidatos[0]
+                else:
+                    log.warning(
+                        "Puntaje suficiente pero no se identificó ningún "
+                        "proceso responsable (ni por archivo abierto ni por "
+                        "E/S). Verifica que el detector corre como "
+                        "Administrador."
+                    )
+                    continue
 
             log.warning("PATRÓN DE RANSOMWARE DETECTADO. Iniciando contención autónoma.")
-            proc_objetivo, tasa_objetivo = candidatos[0]
-            log.info(
-                f"Objetivo seleccionado: {proc_objetivo.name()} "
-                f"(PID {proc_objetivo.pid}), {tasa_objetivo/1024:.1f} KB/s"
-            )
             contener_amenaza(proc_objetivo)
 
             # Limpiar estado tras actuar, para no re-disparar sobre el mismo evento
