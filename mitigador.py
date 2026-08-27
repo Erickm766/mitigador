@@ -407,10 +407,18 @@ _registro_lock = threading.Lock()
 _registro_archivos_abiertos = {}  # ruta -> (pid, nombre, timestamp)
 
 
-def hilo_muestreo_archivos_abiertos(intervalo=0.25):
+def hilo_muestreo_archivos_abiertos(intervalo=0.8):
+    """
+    NOTA DE RENDIMIENTO: proc.open_files() es una de las llamadas más
+    costosas de psutil en Windows (enumera handles a nivel de sistema
+    operativo). Recorrer TODOS los procesos activos muy frecuentemente
+    puede saturar CPU y hacer que el hilo de análisis principal se vea
+    "congelado" por falta de turno de ejecución. Si en tu equipo sigue
+    viéndose lento, sube el valor de `intervalo` (por ejemplo a 1.5).
+    """
     while True:
-        time.sleep(intervalo)
-        ahora = time.time()
+        inicio_pasada = time.time()
+
         for proc in psutil.process_iter(["pid", "name"]):
             try:
                 pid = proc.info["pid"]
@@ -425,12 +433,25 @@ def hilo_muestreo_archivos_abiertos(intervalo=0.25):
                     if ruta_excluida(ruta):
                         continue
                     with _registro_lock:
-                        _registro_archivos_abiertos[ruta] = (pid, nombre, ahora)
+                        _registro_archivos_abiertos[ruta] = (pid, nombre, time.time())
 
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
+            except Exception:
+                # Cualquier proceso "raro" no debe tumbar el hilo completo
+                continue
+
+        duracion_pasada = time.time() - inicio_pasada
+        if duracion_pasada > intervalo * 2:
+            log.warning(
+                f"El muestreo de archivos abiertos tardó {duracion_pasada:.2f}s "
+                f"(más del doble del intervalo configurado de {intervalo}s). "
+                f"Esto puede hacer que el detector se sienta lento. Considera "
+                f"aumentar 'intervalo' en hilo_muestreo_archivos_abiertos()."
+            )
 
         # Purga de entradas viejas para no crecer indefinidamente
+        ahora = time.time()
         with _registro_lock:
             vencidas = [
                 r for r, (_, _, ts) in _registro_archivos_abiertos.items()
@@ -438,6 +459,12 @@ def hilo_muestreo_archivos_abiertos(intervalo=0.25):
             ]
             for r in vencidas:
                 del _registro_archivos_abiertos[r]
+
+        # Descansar lo que quede del intervalo (si la pasada ya tardó más
+        # que el intervalo completo, seguir de inmediato sin dormir)
+        restante = intervalo - duracion_pasada
+        if restante > 0:
+            time.sleep(restante)
 
 
 def identificar_por_archivos_abiertos(rutas_recientes: set):
