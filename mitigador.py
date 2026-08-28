@@ -4,6 +4,7 @@ import shutil
 import time
 import ctypes
 import psutil
+from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -56,6 +57,23 @@ class ContencionRansomware(FileSystemEventHandler):
             print(f"📊 Ráfaga: {len(self.contador_eventos)} archivos alterados en {VENTANA_TIEMPO}s.")
             self.ejecutar_mitigacion_heuristica()
 
+    def generar_log_cmd(self, pid, nombre, cmd, ruta_aislada):
+        """Imprime un informe directo y detallado del incidente en la consola."""
+        fecha_hora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        print("\n" + "=" * 65)
+        print(" 📄 INFORME DE INCIDENTE Y MITIGACIÓN DE AMENAZA".center(65))
+        print("=" * 65)
+        print(f" 🕒 Fecha y Hora    : {fecha_hora}")
+        print(f" ⚠️ Vector Detectado : Tasa anormal de modificaciones masivas I/O")
+        print(f" 🆔 PID Neutralizado : {pid}")
+        print(f" 🖥️ Proceso Padre   : {nombre}")
+        print(f" ⚙️ Comando Ejecutado: {cmd}")
+        print(f" ⚡ Acción Tomada   : Proceso eliminado (SIGKILL a nivel Kernel)")
+        print(f" 🔒 Estado Final    : Aislado e inactivado")
+        print(f" 📁 Ruta Cuarentena : {ruta_aislada if ruta_aislada else 'N/A'}")
+        print("=" * 65 + "\n")
+
     def ejecutar_mitigacion_heuristica(self):
         proceso_objetivo = None
 
@@ -71,7 +89,6 @@ class ContencionRansomware(FileSystemEventHandler):
 
                 # DETECCIÓN CLAVE: Si el proceso es Python ejecutando el script de cifrado
                 if "python.exe" in nombre or "pythonw.exe" in nombre:
-                    # Verificar que no sea el mismo detector
                     if "detector_autonomo" not in cmdline:
                         proceso_objetivo = proc
                         break
@@ -84,20 +101,22 @@ class ContencionRansomware(FileSystemEventHandler):
                 pid = proceso_objetivo.info['pid']
                 nombre = proceso_objetivo.info['name']
                 cmd = " ".join(proceso_objetivo.info['cmdline'] or [])
+                ruta_aislada = None
 
                 # 1. Detener inmediatamente la instancia de Python que ejecuta el ransomware
                 proceso_objetivo.kill()
                 self.proceso_mitigado = True
-                print(f"⚡ [AUTÓNOMO] Proceso malicioso detectado y DETENIDO (PID: {pid} - {nombre}).")
-                print(f"📌 Comando neutralizado: {cmd}")
 
                 # 2. Intentar mover el archivo .py detectado a cuarentena
                 for arg in proceso_objetivo.info['cmdline']:
                     if arg.endswith(".py") and os.path.exists(arg) and "detector" not in arg:
                         destino = os.path.join(DIR_CUARENTENA, f"{os.path.basename(arg)}.quarantine")
                         shutil.move(arg, destino)
-                        print(f"🔒 [CUARENTENA] Script Python aislado en: {destino}\n")
+                        ruta_aislada = destino
                         break
+
+                # 3. Imprimir el informe en consola
+                self.generar_log_cmd(pid, nombre, cmd, ruta_aislada)
 
             except Exception as e:
                 print(f"❌ Error al mitigar el proceso: {e}")
